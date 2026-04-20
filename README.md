@@ -533,80 +533,143 @@ make test-integration
 
 ---
 
-## Phase 5 & 6: Analysis-Only Questions
+## Phase 5 — Branching and Checkout
 
-The following questions cover filesystem concepts beyond the implementation scope of this lab. Answer them in writing — no code required.
+### Q5.1 — How would you implement `pes checkout <branch>`?
 
-### Branching and Checkout
+**Files that must change in `.pes/`:**
 
-**Q5.1:** A branch in Git is just a file in `.git/refs/heads/` containing a commit hash. Creating a branch is creating a file. Given this, how would you implement `pes checkout <branch>` — what files need to change in `.pes/`, and what must happen to the working directory? What makes this operation complex?
+1. `.pes/HEAD` — rewrite the line from `ref: refs/heads/<current>` to
+   `ref: refs/heads/<target>`.
+2. If the target branch is new, create `.pes/refs/heads/<target>` pointing to
+   the desired commit hash.
 
-**Q5.2:** When switching branches, the working directory must be updated to match the target branch's tree. If the user has uncommitted changes to a tracked file, and that file differs between branches, checkout must refuse. Describe how you would detect this "dirty working directory" conflict using only the index and the object store.
+**Working-directory update:**
 
-**Q5.3:** "Detached HEAD" means HEAD contains a commit hash directly instead of a branch reference. What happens if you make commits in this state? How could a user recover those commits?
+1. Read the target branch tip from `.pes/refs/heads/<branch>`.
+2. `object_read` the root tree of that commit.
+3. Recursively walk the tree: for blob entries write (or overwrite) the file in
+   the working directory; for tree entries (mode `040000`) create directories.
+4. Delete any working-directory file that is present in the *current* HEAD's
+   tree but absent from the target tree.
 
-### Garbage Collection and Space Reclamation
+**What makes this complex:**
 
-**Q6.1:** Over time, the object store accumulates unreachable objects — blobs, trees, or commits that no branch points to (directly or transitively). Describe an algorithm to find and delete these objects. What data structure would you use to track "reachable" hashes efficiently? For a repository with 100,000 commits and 50 branches, estimate how many objects you'd need to visit.
+- **Dirty-file conflicts.** If a tracked file has local modifications and the
+  target branch has a different version of that file, checkout must refuse or
+  the user's edits are destroyed silently.
+- **Untracked-file collisions.** If an untracked file sits at a path that the
+  target tree would create, checkout must refuse to avoid clobbering it.
+- **Partial failure.** A crash halfway through leaves a mixed working directory.
+  A production implementation writes a lock or in-progress marker to allow
+  recovery.
+- **Three-way diff.** Deciding which files to touch requires comparing the
+  current-HEAD tree, the target-HEAD tree, and the index all at once.
 
-**Q6.2:** Why is it dangerous to run garbage collection concurrently with a commit operation? Describe a race condition where GC could delete an object that a concurrent commit is about to reference. How does Git's real GC avoid this?
+### Q5.2 — Detecting dirty working-directory conflicts
+
+Using only the index and the object store:
+
+1. Load the current index (the staged snapshot matching HEAD after the last
+   commit).
+2. For each entry, `stat()` the working-directory file. If `st_mtime` or
+   `st_size` differs from the stored values, re-hash the file (SHA-256) and
+   compare to the stored hash. A mismatch means the file is dirty.
+3. For each path in the target branch's tree: if that path is in the index and
+   is dirty (step 2), refuse checkout for that path.
+4. For untracked files: if a path in the target tree does not appear in the
+   index but already exists on disk, refuse checkout to avoid overwriting it.
+
+The mtime/size check is a fast first pass; the full hash re-read is the
+authoritative check used only when metadata differs.
+
+### Q5.3 — Detached HEAD and recovery
+
+When HEAD holds a raw commit hash instead of `ref: refs/heads/<branch>`,
+`head_update` writes new hashes directly into HEAD. Commits still chain
+correctly via parent pointers, but no branch file is updated. Once you check
+out a branch, HEAD is overwritten and the detached chain has no ref pointing
+to it — it becomes unreachable from all named references.
+
+**Recovery before switching away:**
+
+```bash
+cat .pes/HEAD                            # note the hash
+echo <hash> > .pes/refs/heads/recovered
+echo "ref: refs/heads/recovered" > .pes/HEAD
+```
+
+**Recovery after switching away:** the commit objects still exist in the object
+store. Walk every file under `.pes/objects/`, call `object_read` on each, and
+look for `OBJ_COMMIT` objects whose parent chain leads to your lost work. Git
+calls this `git fsck --lost-found`. The GC grace period (see Q6.2) keeps the
+objects safe for at least two weeks.
 
 ---
 
-## Submission Checklist
+## Phase 6 — Garbage Collection
 
-### Screenshots Required
+### Q6.1 — Algorithm to find and delete unreachable objects
 
-| Phase | ID  | What to Capture                                                 |
-| ----- | --- | --------------------------------------------------------------- |
-| 1     | 1A  | `./test_objects` output showing all tests passing               |
-| 1     | 1B  | `find .pes/objects -type f` showing sharded directory structure |
-| 2     | 2A  | `./test_tree` output showing all tests passing                  |
-| 2     | 2B  | `xxd` of a raw tree object (first 20 lines)                    |
-| 3     | 3A  | `pes init` → `pes add` → `pes status` sequence                 |
-| 3     | 3B  | `cat .pes/index` showing the text-format index                  |
-| 4     | 4A  | `pes log` output with three commits                            |
-| 4     | 4B  | `find .pes -type f \| sort` showing object growth              |
-| 4     | 4C  | `cat .pes/refs/heads/main` and `cat .pes/HEAD`                 |
-| Final | --  | Full integration test (`make test-integration`)                 |
+**Mark-and-sweep:**
 
-### Code Files Required (5 files)
+*Mark phase — build the reachable set:*
 
-| File           | Description                              |
-| -------------- | ---------------------------------------- |
-| `object.c`     | Object store implementation              |
-| `tree.c`       | Tree serialization and construction      |
-| `index.c`      | Staging area implementation              |
-| `commit.c`     | Commit creation and history walking      |
+1. Enumerate every file under `.pes/refs/` and read `HEAD` to get the GC roots.
+2. For each root commit hash, call `object_read`. Add its hash, the tree hash,
+   and every blob/subtree hash found by recursively walking the tree to a
+   `reachable` set. Follow each commit's parent pointer until `has_parent == 0`.
 
-### Analysis Questions (written answers)
+*Data structure:* a sorted array of `ObjectID` (32 bytes each) with binary
+search — O(n log n) to build, O(log n) per lookup. A hash table gives O(1)
+average lookup for larger repos.
 
-| Section                   | Questions        |
-| ------------------------- | ---------------- |
-| Branching (analysis-only) | Q5.1, Q5.2, Q5.3 |
-| GC (analysis-only)        | Q6.1, Q6.2       |
+*Sweep phase — delete unreachable objects:*
 
------------
+Walk every file under `.pes/objects/XX/`. Reconstruct the full hash from the
+directory name and filename, convert with `hex_to_hash`. If not in `reachable`,
+call `unlink()`.
 
-## Submission Requirements
+**Estimate for 100,000 commits, 50 branches:**
 
-**1. GitHub Repository**
-* You must submit the link to your GitHub repository via the official submission link (which will be shared by your respective faculty).
-* The repository must strictly maintain the directory structure you built throughout this lab.
-* Ensure your github repository is made `public`
+Assuming roughly four unique objects per commit on average (one commit, one to
+two trees, one to two new blobs, the rest shared):
 
-**2. Lab Report**
-* Your report, containing all required **screenshots** and answers to the **analysis questions**, must be placed at the **root** of your repository directory.
-* The report must be submitted as either a PDF (`report.pdf`) or a Markdown file (`README.md`).
+- Reachable set ≈ 400,000 objects → 400,000 `object_read` calls in the mark
+  phase.
+- Sweep: walk all ~400,000 files in the object store.
+- Total: roughly **800,000 file accesses**.
 
-**3. Commit History (Graded Requirement)**
-* **Minimum Requirement:** You must have a minimum of **5 commits per phase** with appropriate commit messages. Submitting fewer than 5 commits for any given phase will result in a deduction of marks.
-* **Best Practices:** We highly prefer more than 5 detailed commits per phase. Granular commits that clearly show the delta in code block changes allow us to verify your step-by-step understanding of the concepts and prevent penalties <3
+### Q6.2 — Race condition between GC and a concurrent commit
+
+**The race:**
+
+| Time | `pes commit` | GC |
+|------|-------------|-----|
+| t1 | `object_write(OBJ_BLOB)` stores blob B | — |
+| t2 | — | Mark phase reads HEAD → old commit. B is not reachable from any ref. |
+| t3 | `object_write(OBJ_TREE)` creates tree T referencing B | — |
+| t4 | — | Sweep: B is not in reachable set → `unlink(B)` |
+| t5 | `object_write(OBJ_COMMIT)` + `head_update` completes | — |
+
+Result: HEAD now points to a commit whose tree references the deleted blob B.
+The repository is corrupt.
+
+**How Git avoids this:**
+
+1. **Grace period (`gc.pruneExpire`, default 2 weeks).** GC skips any loose
+   object whose filesystem `mtime` is younger than the grace period. A freshly
+   written blob is always newer than two weeks, so it is never collected before
+   it is referenced by a commit.
+2. **Keep-alive refs.** Git writes temporary refs (`FETCH_HEAD`, `MERGE_HEAD`,
+   `ORIG_HEAD`) during in-flight operations, so GC sees those objects as
+   reachable roots.
+3. **Pack-before-prune ordering.** When converting loose objects to pack files,
+   Git writes and verifies the pack before deleting any loose objects, so there
+   is never a window where an object exists only in a half-written pack.
+4. The atomic rename used when writing objects does not help here — blob B is
+   fully written before GC runs. Only the grace period closes the time window
+   reliably.
 
 ---
 
-## Further Reading
-
-- **Git Internals** (Pro Git book): https://git-scm.com/book/en/v2/Git-Internals-Plumbing-and-Porcelain
-- **Git from the inside out**: https://codewords.recurse.com/issues/two/git-from-the-inside-out
-- **The Git Parable**: https://tom.preston-werner.com/2009/05/19/the-git-parable.html
