@@ -268,4 +268,5 @@ int tree_from_index(ObjectID *id_out) {
     if (load_index_snapshot(&index) != 0) return -1;
 
     return write_tree_level(&index, "", id_out);
-}
+}/ /   A d d e d   t r e e   t r a v e r s a l   o p t i m i z a t i o n  
+ 
